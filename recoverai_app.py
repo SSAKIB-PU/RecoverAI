@@ -5,52 +5,57 @@ RecoverAI — Streamlit front-end
 A trauma-informed, GPT-powered co-regulation companion.
 
 Key features
-•  Token-aware or message-count history pruning (auto-switches if `tiktoken` missing)
-•  Crisis-flag detection and safety prompt injection
-•  Manual & automatic conversation summarisation (structured return object)
-•  Robust OpenAI error handling with retries, jittered back-off and model fallback
-•  Developer panel (latency, last error, pruning mode, key check cache)
-•  Session reset modal + transcript download
+• Token-aware OR message-count history pruning (auto-switches if `tiktoken` missing)
+• Crisis-flag detection & safety-prompt injection
+• Manual & automatic conversation summarisation
+• Robust OpenAI error handling with retries, jittered back-off & model fall-back
+• Developer panel (latency, last error, pruning mode, key-check cache)
+• Session reset modal + transcript download
 """
 
 from __future__ import annotations
 
-import os, time, re, random
-from dataclasses import dataclass
+import os, re, time, random
+from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
 import openai
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Optional dependency (token counting) ─ graceful degradation
+# ───────────────────────────────────────────────────────────────────────────────
+# Optional dependency (token counting) — graceful degradation
 try:
     import tiktoken
     TIKTOKEN_AVAILABLE = True
 except ImportError:
     TIKTOKEN_AVAILABLE = False
 
-# Robust import across OpenAI SDK branches
+# Robust NotFoundError import (old / new SDKs)
 try:
     from openai.error import NotFoundError
 except ImportError:
     try:
         from openai import NotFoundError
-    except ImportError:
-        class NotFoundError(Exception):
-            pass
+    except ImportError:  # very old SDK
+        class NotFoundError(Exception):  # noqa: D401
+            """Fallback placeholder when SDK doesn't expose NotFoundError."""
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Global configuration
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Global configuration (immutable dataclass)
 @dataclass(frozen=True)
 class AppCfg:
-    VALID_MODELS: tuple[str, ...] = ("gpt-4o-mini", "gpt-4o", "gpt-4-turbo")
+    VALID_MODELS: tuple[str, ...] = (
+        "gpt-4o-mini", "gpt-4o", "gpt-4-turbo"
+    )
     DEFAULT_MODEL: str = "gpt-4o-mini"
-    MAX_CONTEXT_TOKENS: int = 7_000  # leave buffer for response
-    TOKENS_PER_MESSAGE_OVERHEAD: int = 4  # chat-format overhead heuristic
-    MAX_HISTORY_MESSAGES: int = 30  # fallback when token lib missing
-    SUMMARY_TRIGGER_INTERVAL: int = 10  # non-system messages
-    SUMMARY_COOLDOWN_SECONDS: int = 180  # secs between auto summaries
+
+    MAX_CONTEXT_TOKENS: int = 7_000          # leave buffer for response
+    TOKENS_PER_MESSAGE_OVERHEAD: int = 4     # chat-format overhead heuristic
+    MAX_HISTORY_MESSAGES: int = 30           # fallback when token lib missing
+
+    SUMMARY_TRIGGER_INTERVAL: int = 10       # non-system messages
+    SUMMARY_COOLDOWN_SECONDS: int = 180      # secs between auto-summaries
 
     RISK_PATTERNS: tuple[str, ...] = (
         r"kill myself", r"want to die", r"suicide", r"end it all",
@@ -61,22 +66,24 @@ class AppCfg:
     HIGH_RISK_SAFETY_PROMPT: str = (
         "Safety pre-computation: the user's last message indicates acute self-harm risk. "
         "Switch to crisis-safe mode: prioritise immediate emotional stabilisation, offer "
-        "grounding (e.g., slow breathing for 60 s), validate their pain and gently encourage "
-        "contacting real-world help such as the 988 Suicide & Crisis Lifeline (US) or the "
-        "local equivalent. Do not give medical or legal advice, do not shame, do not promise "
-        "confidentiality. Respond with empathy, short sentences, and invite them to stay connected."
+        "grounding (e.g., slow breathing for 60 s), validate their pain and gently "
+        "encourage contacting real-world help such as the **988** Suicide & Crisis Lifeline "
+        "(US) or the local equivalent. Do **not** give medical or legal advice, do **not** "
+        "shame, do **not** promise confidentiality. Respond with empathy, short sentences, "
+        "and invite them to stay connected."
     )
 
-    USER_ERR: dict[str, str] = {
+    USER_ERR: dict[str, str] = field(default_factory=lambda: {
         "MISSING_KEY": "Please enter your OpenAI API key in the sidebar to continue.",
         "INVALID_KEY": "Your OpenAI API key appears invalid or was rejected. Please double-check it.",
         "RATE_LIMIT":  "OpenAI is rate-limiting right now. Please wait a few seconds and try again.",
         "GENERIC":     "I couldn’t reach OpenAI at the moment. Please check your connection and try again.",
-    }
+    })
 
-CFG = AppCfg()
 
-# ────────────────────────────────────────────────────────────────────────────────
+CFG = AppCfg()  # global constant instance
+
+# ───────────────────────────────────────────────────────────────────────────────
 # Prompt assets
 def build_system_prompt() -> str:
     return (
@@ -99,71 +106,75 @@ def build_system_prompt() -> str:
         "**Closing style**\n"
         "• End with gentle affirmation: “You’re still here. That matters.”\n\n"
         "**Crisis protocol**\n"
-        "• If user expresses intent to self-harm or overdose, follow the crisis safety prompt you will receive from the system role."
+        "• If user expresses intent to self-harm, follow the crisis safety prompt sent by the system."
     )
 
 SUMMARY_PROMPT = (
-    "Draft a ~150-word concise summary of the conversation so far. Capture:\n"
-    "• Prevailing emotional states\n"
-    "• Key milestones / insights\n"
-    "• Immediate concerns\n"
-    "• One realistic next micro-step\n"
-    "Use RecoverAI’s calm, validating voice."
+    "Draft ~150-word concise summary of the conversation so far. Capture:\n"
+    "• Prevailing emotional states\n• Key milestones / insights\n• Immediate concerns\n"
+    "• One realistic next micro-step\nUse RecoverAI’s calm, validating voice."
 )
 
 DISCLAIMER_MD = (
     "**Disclaimer:** RecoverAI is an *experimental* trauma-informed chat assistant. "
     "It does **not** replace professional therapy or legal counsel. If you are in crisis, "
-    "please call emergency services or a local crisis hotline (e.g., **988** in the US) immediately."
+    "call emergency services or a local crisis hotline (e.g., **988** in the US) immediately."
 )
 
-# ────────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
 # Pruning helpers
-def _prune_by_message_count(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    system_msgs = [m for m in messages if m["role"] == "system"]
-    ua_msgs = [m for m in messages if m["role"] != "system"]
-    if len(ua_msgs) > CFG.MAX_HISTORY_MESSAGES:
-        ua_msgs = ua_msgs[-CFG.MAX_HISTORY_MESSAGES:]
-    return system_msgs + ua_msgs
+def _prune_by_count(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    sys = [m for m in msgs if m["role"] == "system"]
+    ua  = [m for m in msgs if m["role"] != "system"]
+    if len(ua) > CFG.MAX_HISTORY_MESSAGES:
+        ua = ua[-CFG.MAX_HISTORY_MESSAGES:]
+    return sys + ua
 
-def token_safe_prune(messages: List[Dict[str, Any]], model: str) -> List[Dict[str, Any]]:
+
+def _prune_by_tokens(msgs: List[Dict[str, Any]], model: str) -> List[Dict[str, Any]]:
     if not TIKTOKEN_AVAILABLE:
-        return _prune_by_message_count(messages)
+        return _prune_by_count(msgs)
+
     try:
         enc = tiktoken.encoding_for_model(model)
     except Exception:
         enc = tiktoken.get_encoding("cl100k_base")
-    system_msgs = [m for m in messages if m["role"] == "system"]
-    ua_msgs = [m for m in messages if m["role"] != "system"]
-    def msg_tokens(m: Dict[str, str]) -> int:
-        return len(enc.encode(m["content"])) + CFG.TOKENS_PER_MESSAGE_OVERHEAD
-    total = sum(msg_tokens(m) for m in messages)
-    while total > CFG.MAX_CONTEXT_TOKENS and ua_msgs:
-        removed = ua_msgs.pop(0)
-        total -= msg_tokens(removed)
-    return system_msgs + ua_msgs
 
-def prune_history(messages: List[Dict[str, Any]], model: str) -> List[Dict[str, Any]]:
-    if not messages:
+    sys = [m for m in msgs if m["role"] == "system"]
+    ua  = [m for m in msgs if m["role"] != "system"]
+
+    def tokens(m: Dict[str, str]) -> int:
+        return len(enc.encode(m["content"])) + CFG.TOKENS_PER_MESSAGE_OVERHEAD
+
+    total = sum(tokens(m) for m in msgs)
+    while total > CFG.MAX_CONTEXT_TOKENS and ua:
+        total -= tokens(ua.pop(0))
+    return sys + ua
+
+
+def prune_history(msgs: List[Dict[str, Any]], model: str) -> List[Dict[str, Any]]:
+    if not msgs:
         return []
-    return token_safe_prune(messages, model) if TIKTOKEN_AVAILABLE else _prune_by_message_count(messages)
+    return _prune_by_tokens(msgs, model) if TIKTOKEN_AVAILABLE else _prune_by_count(msgs)
+
 
 def is_high_risk(text: str) -> bool:
-    return any(re.search(pat, text.lower()) for pat in CFG.RISK_PATTERNS)
+    return any(re.search(p, text.lower()) for p in CFG.RISK_PATTERNS)
 
-# ────────────────────────────────────────────────────────────────────────────────
-# OpenAI interaction
+# ───────────────────────────────────────────────────────────────────────────────
+# OpenAI helpers
 def init_openai_client(api_key: str | None) -> Optional[Any]:
     if not api_key:
         return None
-    try:
-        return openai.OpenAI(api_key=api_key)  # newer SDK
-    except TypeError:
-        openai.api_key = api_key               # legacy style
+    try:                        # ≥ 1.3
+        return openai.OpenAI(api_key=api_key)
+    except TypeError:           # ≤ 1.2
+        openai.api_key = api_key
         return openai.OpenAI()
 
+
 def call_openai_api(
-    messages: List[Dict[str, Any]],
+    msgs: List[Dict[str, Any]],
     client: Optional[Any],
     model: str,
     temperature: float,
@@ -173,33 +184,35 @@ def call_openai_api(
 ) -> str:
     if client is None:
         return CFG.USER_ERR["MISSING_KEY"]
-    metrics = st.session_state.setdefault("metrics", {})
+
+    m = st.session_state.setdefault("metrics", {})
     backoff, attempt = 1.0, 0
+
     while attempt < 3:
         attempt += 1
         start = time.time()
         try:
             resp = client.chat.completions.create(
                 model=model,
-                messages=messages,
+                messages=msgs,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-            metrics["last_latency"] = time.time() - start
+            m["last_latency"] = time.time() - start
             return resp.choices[0].message.content or "I received an empty response. Please retry."
         except NotFoundError:
             if attempt_fallback and model != CFG.DEFAULT_MODEL:
                 st.warning(f"Model **{model}** unavailable; falling back to **{CFG.DEFAULT_MODEL}**.")
-                return call_openai_api(messages, client, CFG.DEFAULT_MODEL, temperature, max_tokens,
+                return call_openai_api(msgs, client, CFG.DEFAULT_MODEL, temperature, max_tokens,
                                        allow_retry, attempt_fallback=False)
-            metrics["last_error"] = f"Model {model!r} not found."
-            return metrics["last_error"]
+            m["last_error"] = f"Model {model!r} not found."
+            return m["last_error"]
         except Exception as e:
-            err_l = str(e).lower()
-            metrics["last_error"] = err_l
-            if "invalid api key" in err_l or "authentication" in err_l:
+            err = str(e).lower()
+            m["last_error"] = err
+            if "invalid api key" in err or "authentication" in err:
                 return CFG.USER_ERR["INVALID_KEY"]
-            if "rate limit" in err_l:
+            if "rate limit" in err:
                 if not allow_retry or attempt >= 3:
                     return CFG.USER_ERR["RATE_LIMIT"]
             elif not allow_retry:
@@ -208,8 +221,8 @@ def call_openai_api(
             backoff = min(backoff * 2, 8.0)
     return CFG.USER_ERR["GENERIC"]
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Summarisation
+# ───────────────────────────────────────────────────────────────────────────────
+# Summaries
 def generate_session_summary(
     history: List[Dict[str, Any]],
     client: Optional[Any],
@@ -218,135 +231,152 @@ def generate_session_summary(
 ) -> dict[str, Any]:
     if client is None:
         return {"success": False, "text": CFG.USER_ERR["MISSING_KEY"]}
+
     pruned = prune_history(history.copy(), model)
     pruned.append({"role": "user", "content": SUMMARY_PROMPT})
-    text = call_openai_api(pruned, client, model, temperature, max_tokens=300, allow_retry=False)
-    success = bool(text) and "error" not in text.lower() and "please enter your openai api key" not in text.lower()
-    return {"success": success, "text": text}
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Session + UI helpers
-def reset_session(system_prompt: str) -> None:
+    txt = call_openai_api(pruned, client, model, temperature, max_tokens=300, allow_retry=False)
+    ok  = bool(txt) and "error" not in txt.lower() and "api key" not in txt.lower()
+    return {"success": ok, "text": txt}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Session helpers
+def reset_session(sys_prompt: str) -> None:
     st.session_state.clear()
-    initialize_session(system_prompt)
+    initialize_session(sys_prompt)
 
-def initialize_session(system_prompt: str) -> None:
+
+def initialize_session(sys_prompt: str) -> None:
     if "messages" not in st.session_state:
-        st.session_state.messages = [{"role": "system", "content": system_prompt}]
-        st.session_state.generated_summaries: list[str] = []
-        st.session_state.last_summary_len = 0
-        st.session_state.last_summary_time = 0
-        st.session_state.show_clear_modal = False
-        st.session_state.metrics = {}
-        st.session_state.key_validated = None
-        st.session_state.cached_key = None
-        st.session_state.cached_model = None
+        st.session_state.messages             = [{"role": "system", "content": sys_prompt}]
+        st.session_state.generated_summaries  = []      # type: list[str]
+        st.session_state.last_summary_len     = 0
+        st.session_state.last_summary_time    = 0.0
+        st.session_state.show_clear_modal     = False
+        st.session_state.metrics              = {}
+        st.session_state.key_validated        = None
+        st.session_state.cached_key           = None
+        st.session_state.cached_model         = None
+
 
 def validate_api_key(api_key: str, client: Optional[Any], model: str) -> bool:
     if not api_key or client is None:
         return False
-    probe = [{"role": "system", "content": "Respond with OK."}, {"role": "user", "content": "Ping"}]
-    reply = call_openai_api(probe, client, model, temperature=0.0, max_tokens=5, allow_retry=False)
+    probe = [
+        {"role": "system", "content": "Respond with OK."},
+        {"role": "user",   "content": "Ping"},
+    ]
+    reply = call_openai_api(probe, client, model, 0.0, 5, allow_retry=False)
     return reply.strip().lower().startswith("ok")
+
 
 def get_openai_api_key() -> str:
     return st.sidebar.text_input(
         "OpenAI API key",
         type="password",
         value=os.getenv("OPENAI_API_KEY", ""),
-        help="Find it at https://platform.openai.com/account/api-keys",
+        help="Create / view at https://platform.openai.com/account/api-keys",
     ).strip()
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Streamlit main
+# ───────────────────────────────────────────────────────────────────────────────
+# Main Streamlit app
 def main() -> None:
     st.set_page_config("RecoverAI Prototype", "🧠", layout="wide")
     st.title("🧠 RecoverAI — trauma-informed support")
     st.markdown(DISCLAIMER_MD)
 
-    system_prompt_text = build_system_prompt()
-    initialize_session(system_prompt_text)
+    sys_prompt = build_system_prompt()
+    initialize_session(sys_prompt)
 
+    # ─ Sidebar
     with st.sidebar:
         st.header("Configuration")
-        api_key = get_openai_api_key()
-        model_choice = st.selectbox("Model", CFG.VALID_MODELS, index=CFG.VALID_MODELS.index(CFG.DEFAULT_MODEL))
+        api_key     = get_openai_api_key()
+        model_choice = st.selectbox("Model", CFG.VALID_MODELS,
+                                    index=CFG.VALID_MODELS.index(CFG.DEFAULT_MODEL))
         temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.6, 0.1)
-        max_tokens = st.slider("Max response tokens", 256, 4096, 1024, 128)
+        max_tokens  = st.slider("Max response tokens", 256, 4096, 1024, 128)
 
         if st.button("Clear conversation", use_container_width=True):
             st.session_state.show_clear_modal = True
 
         if st.button("Manual summary", use_container_width=True):
-            client_test = init_openai_client(api_key)
+            c_test = init_openai_client(api_key)
             with st.spinner("Summarising…"):
-                summary_obj = generate_session_summary(st.session_state.messages, client_test, model_choice, temperature)
-            if summary_obj["success"]:
-                st.session_state.generated_summaries.append(summary_obj["text"])
-                st.session_state.last_summary_len = len([m for m in st.session_state.messages if m["role"] != "system"])
+                s_obj = generate_session_summary(st.session_state.messages, c_test, model_choice, temperature)
+            if s_obj["success"]:
+                st.session_state.generated_summaries.append(s_obj["text"])
+                st.session_state.last_summary_len  = len([m for m in st.session_state.messages if m["role"] != "system"])
                 st.session_state.last_summary_time = time.time()
-                st.success("Summary added in sidebar.")
+                st.success("Summary added (see 'Past summaries').")
             else:
-                st.error(summary_obj["text"])
+                st.error(s_obj["text"])
 
         if len(st.session_state.messages) > 1:
-            transcript = "\n\n".join(
-                f"{m['role'].upper()}: {m['content']}" for m in st.session_state.messages if m["role"] != "system"
-            )
-            st.download_button("Download transcript", transcript, "recoverai_transcript.txt", use_container_width=True)
+            transcript = "\n\n".join(f"{m['role'].upper()}: {m['content']}"
+                                     for m in st.session_state.messages if m["role"] != "system")
+            st.download_button("Download transcript", transcript,
+                               "recoverai_transcript.txt", use_container_width=True)
 
         st.checkbox("Show developer panel", key="show_dev")
 
+    # ─ OpenAI client (once)
     client = init_openai_client(api_key)
 
+    # validate key (dev panel)
     if st.session_state.get("show_dev"):
-        if api_key and (st.session_state.cached_key != api_key or st.session_state.cached_model != model_choice):
+        if api_key and (st.session_state.cached_key != api_key
+                        or st.session_state.cached_model != model_choice):
             with st.spinner("Validating key…"):
                 st.session_state.key_validated = validate_api_key(api_key, client, model_choice)
-            st.session_state.cached_key, st.session_state.cached_model = api_key, model_choice
+            st.session_state.cached_key   = api_key
+            st.session_state.cached_model = model_choice
 
-    for msg in st.session_state.messages:
-        if msg["role"] != "system":
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+    # ─ Display history
+    for m in st.session_state.messages:
+        if m["role"] != "system":
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
 
-    if user_input := st.chat_input("Your message…"):
-        st.session_state.messages.append({"role": "user", "content": user_input})
+    # ─ User input
+    if user_in := st.chat_input("Your message…"):
+        st.session_state.messages.append({"role": "user", "content": user_in})
         with st.chat_message("user"):
-            st.markdown(user_input)
+            st.markdown(user_in)
 
-        messages_to_send = prune_history(st.session_state.messages, model_choice)
+        msgs_send = prune_history(st.session_state.messages, model_choice)
 
-        risk_flag = is_high_risk(user_input)
-        if risk_flag:
-            st.warning("If you’re thinking of harming yourself, please contact a crisis line (988 in the US) or local emergency services.")
-            sys_part = [m for m in messages_to_send if m["role"] == "system"]
-            ua_part = [m for m in messages_to_send if m["role"] != "system"]
-            messages_to_send = sys_part + [{"role": "system", "content": CFG.HIGH_RISK_SAFETY_PROMPT}] + ua_part
+        if is_high_risk(user_in):
+            st.warning("If you’re thinking of harming yourself, please contact a crisis line "
+                       "(**988** in the US) or local emergency services.")
+            sys = [m for m in msgs_send if m["role"] == "system"]
+            ua  = [m for m in msgs_send if m["role"] != "system"]
+            msgs_send = sys + [{"role": "system", "content": CFG.HIGH_RISK_SAFETY_PROMPT}] + ua
 
         with st.chat_message("assistant"):
             with st.spinner("RecoverAI is thinking…"):
-                assistant_reply = call_openai_api(
-                    messages_to_send, client, model_choice, temperature, max_tokens
-                )
-            st.markdown(assistant_reply)
+                reply = call_openai_api(msgs_send, client, model_choice,
+                                        temperature, max_tokens)
+            st.markdown(reply)
 
-        st.session_state.messages.append({"role": "assistant", "content": assistant_reply})
+        st.session_state.messages.append({"role": "assistant", "content": reply})
         st.session_state.messages = prune_history(st.session_state.messages, model_choice)
 
+    # ─ Automatic summary
     non_sys = len([m for m in st.session_state.messages if m["role"] != "system"])
-    since_last = time.time() - st.session_state.last_summary_time
-    if (client and non_sys >= CFG.SUMMARY_TRIGGER_INTERVAL and
-        non_sys - st.session_state.last_summary_len >= CFG.SUMMARY_TRIGGER_INTERVAL and
-        since_last > CFG.SUMMARY_COOLDOWN_SECONDS):
+    since   = time.time() - st.session_state.last_summary_time
+    if (client and non_sys >= CFG.SUMMARY_TRIGGER_INTERVAL
+            and non_sys - st.session_state.last_summary_len >= CFG.SUMMARY_TRIGGER_INTERVAL
+            and since > CFG.SUMMARY_COOLDOWN_SECONDS):
         with st.spinner("Auto-summarising…"):
-            summ_obj = generate_session_summary(st.session_state.messages, client, model_choice, temperature)
-        if summ_obj["success"]:
-            st.session_state.generated_summaries.append(summ_obj["text"])
-            st.session_state.last_summary_len = non_sys
+            s_obj = generate_session_summary(st.session_state.messages, client, model_choice, temperature)
+        if s_obj["success"]:
+            st.session_state.generated_summaries.append(s_obj["text"])
+            st.session_state.last_summary_len  = non_sys
             st.session_state.last_summary_time = time.time()
             st.success("Automatic summary added (sidebar).")
 
+    # ─ Developer panel
     if st.session_state.get("show_dev"):
         with st.sidebar.expander("DEV / DEBUG", expanded=False):
             st.info(f"API key valid: **{st.session_state.key_validated}**")
@@ -357,24 +387,25 @@ def main() -> None:
             if "last_error" in met:
                 st.error(f"Last error: {met['last_error']}")
 
+    # ─ Past summaries
     if st.session_state.get("generated_summaries"):
         with st.sidebar.expander("Past summaries"):
             for i, s in enumerate(reversed(st.session_state.generated_summaries), 1):
                 st.markdown(f"**{i}.** {s}")
                 st.markdown("---")
 
+    # ─ Clear-conversation modal
     if st.session_state.show_clear_modal:
         with st.modal("Confirm reset"):
             st.write("This will permanently delete the current conversation.")
             c1, c2 = st.columns(2)
             if c1.button("Yes, reset", type="primary", use_container_width=True):
-                reset_session(system_prompt_text)
+                reset_session(sys_prompt)
                 st.rerun()
             if c2.button("Cancel", use_container_width=True):
                 st.session_state.show_clear_modal = False
                 st.rerun()
 
+
 if __name__ == "__main__":
     main()
-
-
