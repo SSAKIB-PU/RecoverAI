@@ -16,7 +16,7 @@ Key features
 from __future__ import annotations
 
 import os, time, re, random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
 import streamlit as st
@@ -67,12 +67,12 @@ class AppCfg:
         "confidentiality. Respond with empathy, short sentences, and invite them to stay connected."
     )
 
-    USER_ERR: dict[str, str] = {
+    USER_ERR: dict[str, str] = field(default_factory=lambda: {
         "MISSING_KEY": "Please enter your OpenAI API key in the sidebar to continue.",
         "INVALID_KEY": "Your OpenAI API key appears invalid or was rejected. Please double-check it.",
         "RATE_LIMIT":  "OpenAI is rate-limiting right now. Please wait a few seconds and try again.",
         "GENERIC":     "I couldn’t reach OpenAI at the moment. Please check your connection and try again.",
-    }
+    })
 
 CFG = AppCfg()
 
