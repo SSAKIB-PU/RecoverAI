@@ -101,7 +101,7 @@ def call_openai_api(messages: List[Dict[str, str]], key: str) -> str:
     try:
         openai.api_key = key
         response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
+            model="GPT-4.1 nano",
             messages=messages,
             temperature=0.6,
             max_tokens=512,
