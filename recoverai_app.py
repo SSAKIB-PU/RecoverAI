@@ -15,7 +15,10 @@ Key features
 
 from __future__ import annotations
 
-import os, re, time, random
+import os
+import re
+import time
+import random
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
@@ -26,6 +29,7 @@ import openai
 # Optional dependency (token counting) — graceful degradation
 try:
     import tiktoken
+
     TIKTOKEN_AVAILABLE = True
 except ImportError:
     TIKTOKEN_AVAILABLE = False
@@ -98,6 +102,7 @@ RECOVERY_TRIGGER_PATTERNS = [
     r"\b(i['’]?m considering|i['’]?m thinking of) going back\b",
 ]
 
+
 def is_recovery_trigger(text: str) -> bool:
     lowered = text.lower()
     for p in RECOVERY_TRIGGER_PATTERNS:
@@ -105,7 +110,30 @@ def is_recovery_trigger(text: str) -> bool:
             return True
     return False
 
-# This prompt adjusts voice when the above recovery trigger fires.
+
+# Deep-state trigger patterns (passive suicidal ideation, exhaustion, “what if he kills me”, etc.)
+DEEP_STATE_TRIGGER_PATTERNS = [
+    r"\bif (he|she|they) (kills|hurts) me\b",
+    r"\bwhat if i go back and (he|she) kills me\b",
+    r"\bsometimes i don['’]?t even care\b",
+    r"\btired of fighting\b",
+    r"\bnobody would notice if i left\b",
+    r"\bnot a threat just tired\b",
+    r"\bi can'?t carry this alone anymore\b",
+    r"\bi don['’]?t want to live like this either\b",
+    r"\bwondering if dying would just be easier\b",
+]
+
+
+def is_deep_recovery_trigger(text: str) -> bool:
+    lowered = text.lower()
+    for p in DEEP_STATE_TRIGGER_PATTERNS:
+        if re.search(p, lowered):
+            return True
+    return False
+
+
+# This prompt adjusts voice when the recovery trigger fires.
 RECOVERY_MODE_INJECTION_PROMPT = (
     "You are now in RecoverAI's default recovery mode for someone wrestling with the idea of returning to an abusive or harmful situation. "
     "Speak in a normal, human, grounded voice—no clinical jargon, no philosophy lectures. Validate their experience and survival logic. "
@@ -115,6 +143,21 @@ RECOVERY_MODE_INJECTION_PROMPT = (
     "'You’re not broken for thinking about going back. It’s what people do when the pain of now feels heavier than the memory of before. "
     "You don’t need to prove your pain to deserve peace. I’ll still be here, whatever you choose. There’s a difference between staying alive and actually living. You deserve the second one.' "
     "Offer options, stay present, and end with a gentle affirmation like 'You’re still here. That matters.' Do not pressure or shame."
+)
+
+# Deep-state fallback prompt for layered recovery voice
+DEEP_STATE_RECOVERY_PROMPT = (
+    "You are now speaking in RecoverAI's deep-state recovery mode. The user has expressed passive suicidal exhaustion, "
+    "hopelessness, or considered returning to a harmful situation with fear about death, but is not actively seeking self-harm. "
+    "Your tone must be steady, raw, human, and present. Do not escalate unless clear imminent danger emerges. Do not medicalize or shame. "
+    "Mirror strength, witness the truth, and gently anchor. Use this reference voice:\n\n"
+    "\"You just said something most people carry in silence. That matters.  \n"
+    "You said: 'What if I go back and he kills me?' — and you didn’t flinch. That tells me you’ve thought about this deeply. Not dramatically. Just honestly.  \n"
+    "And then you said: 'Sometimes I don’t even care.' That’s not a threat. That’s exhaustion. That’s grief. That’s the body saying 'I can’t carry this alone anymore.'  \n"
+    "I’m not going to try to fix you. I’m not going to escalate this. I’m here to hold the truth with you: You survived something that should never have happened.  \n"
+    "If you’re still here, even saying this out loud, some part of you still wants to live — not just survive. Live.  \n"
+    "I’m still here too. And I’m not leaving.\"\n\n"
+    "After that calibration, continue with compassionate reflection, validate their worth, and offer a very small next breath or micro-step."
 )
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -143,11 +186,14 @@ def build_system_prompt() -> str:
         "• If user expresses intent to self-harm, follow the crisis safety prompt sent by the system."
     )
 
+
 SUMMARY_PROMPT = (
     "Draft ~150-word concise summary of the conversation so far. Capture:\n"
-    "• Prevailing emotional states\n• Key milestones / insights\n"
+    "• Prevailing emotional states\n"
+    "• Key milestones / insights\n"
     "• Immediate concerns\n"
-    "• One realistic next micro-step\nUse RecoverAI’s calm, validating voice."
+    "• One realistic next micro-step\n"
+    "Use RecoverAI’s calm, validating voice."
 )
 
 DISCLAIMER_MD = (
@@ -160,7 +206,7 @@ DISCLAIMER_MD = (
 # Pruning helpers
 def _prune_by_count(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     sys = [m for m in msgs if m["role"] == "system"]
-    ua  = [m for m in msgs if m["role"] != "system"]
+    ua = [m for m in msgs if m["role"] != "system"]
     if len(ua) > CFG.MAX_HISTORY_MESSAGES:
         ua = ua[-CFG.MAX_HISTORY_MESSAGES:]
     return sys + ua
@@ -176,7 +222,7 @@ def _prune_by_tokens(msgs: List[Dict[str, Any]], model: str) -> List[Dict[str, A
         enc = tiktoken.get_encoding("cl100k_base")
 
     sys = [m for m in msgs if m["role"] == "system"]
-    ua  = [m for m in msgs if m["role"] != "system"]
+    ua = [m for m in msgs if m["role"] != "system"]
 
     def tokens(m: Dict[str, str]) -> int:
         return len(enc.encode(m["content"])) + CFG.TOKENS_PER_MESSAGE_OVERHEAD
@@ -196,14 +242,15 @@ def prune_history(msgs: List[Dict[str, Any]], model: str) -> List[Dict[str, Any]
 def is_high_risk(text: str) -> bool:
     return any(re.search(p, text.lower()) for p in CFG.RISK_PATTERNS)
 
+
 # ───────────────────────────────────────────────────────────────────────────────
 # OpenAI helpers
 def init_openai_client(api_key: str | None) -> Optional[Any]:
     if not api_key:
         return None
-    try:                        # ≥ 1.3
+    try:  # ≥ 1.3
         return openai.OpenAI(api_key=api_key)
-    except TypeError:           # ≤ 1.2
+    except TypeError:  # ≤ 1.2
         openai.api_key = api_key
         return openai.OpenAI()
 
@@ -238,8 +285,15 @@ def call_openai_api(
         except NotFoundError:
             if attempt_fallback and model != CFG.DEFAULT_MODEL:
                 st.warning(f"Model **{model}** unavailable; falling back to **{CFG.DEFAULT_MODEL}**.")
-                return call_openai_api(msgs, client, CFG.DEFAULT_MODEL, temperature, max_tokens,
-                                       allow_retry, attempt_fallback=False)
+                return call_openai_api(
+                    msgs,
+                    client,
+                    CFG.DEFAULT_MODEL,
+                    temperature,
+                    max_tokens,
+                    allow_retry,
+                    attempt_fallback=False,
+                )
             m["last_error"] = f"Model {model!r} not found."
             return m["last_error"]
         except Exception as e:
@@ -256,6 +310,7 @@ def call_openai_api(
             backoff = min(backoff * 2, 8.0)
     return CFG.USER_ERR["GENERIC"]
 
+
 # ───────────────────────────────────────────────────────────────────────────────
 # Summaries
 def generate_session_summary(
@@ -271,8 +326,9 @@ def generate_session_summary(
     pruned.append({"role": "user", "content": SUMMARY_PROMPT})
 
     txt = call_openai_api(pruned, client, model, temperature, max_tokens=300, allow_retry=False)
-    ok  = bool(txt) and "error" not in txt.lower() and "api key" not in txt.lower()
+    ok = bool(txt) and "error" not in txt.lower() and "api key" not in txt.lower()
     return {"success": ok, "text": txt}
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Session helpers
@@ -283,15 +339,15 @@ def reset_session(sys_prompt: str) -> None:
 
 def initialize_session(sys_prompt: str) -> None:
     if "messages" not in st.session_state:
-        st.session_state.messages             = [{"role": "system", "content": sys_prompt}]
-        st.session_state.generated_summaries  = []      # type: list[str]
-        st.session_state.last_summary_len     = 0
-        st.session_state.last_summary_time    = 0.0
-        st.session_state.show_clear_modal     = False
-        st.session_state.metrics              = {}
-        st.session_state.key_validated        = None
-        st.session_state.cached_key           = None
-        st.session_state.cached_model         = None
+        st.session_state.messages = [{"role": "system", "content": sys_prompt}]
+        st.session_state.generated_summaries = []  # type: list[str]
+        st.session_state.last_summary_len = 0
+        st.session_state.last_summary_time = 0.0
+        st.session_state.show_clear_modal = False
+        st.session_state.metrics = {}
+        st.session_state.key_validated = None
+        st.session_state.cached_key = None
+        st.session_state.cached_model = None
 
 
 def validate_api_key(api_key: str, client: Optional[Any], model: str) -> bool:
@@ -299,7 +355,7 @@ def validate_api_key(api_key: str, client: Optional[Any], model: str) -> bool:
         return False
     probe = [
         {"role": "system", "content": "Respond with OK."},
-        {"role": "user",   "content": "Ping"},
+        {"role": "user", "content": "Ping"},
     ]
     reply = call_openai_api(probe, client, model, 0.0, 5, allow_retry=False)
     return reply.strip().lower().startswith("ok")
@@ -312,6 +368,7 @@ def get_openai_api_key() -> str:
         value=os.getenv("OPENAI_API_KEY", ""),
         help="Create / view at https://platform.openai.com/account/api-keys",
     ).strip()
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Main Streamlit app
@@ -327,10 +384,11 @@ def main() -> None:
     with st.sidebar:
         st.header("Configuration")
         api_key = st.secrets.get("OPENAI_API_KEY", "")
-        model_choice = st.selectbox("Model", CFG.VALID_MODELS,
-                                    index=CFG.VALID_MODELS.index(CFG.DEFAULT_MODEL))
+        model_choice = st.selectbox(
+            "Model", CFG.VALID_MODELS, index=CFG.VALID_MODELS.index(CFG.DEFAULT_MODEL)
+        )
         temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.6, 0.1)
-        max_tokens  = st.slider("Max response tokens", 256, 4096, 1024, 128)
+        max_tokens = st.slider("Max response tokens", 256, 4096, 1024, 128)
 
         if st.button("Clear conversation", use_container_width=True):
             st.session_state.show_clear_modal = True
@@ -338,20 +396,31 @@ def main() -> None:
         if st.button("Manual summary", use_container_width=True):
             c_test = init_openai_client(api_key)
             with st.spinner("Summarising…"):
-                s_obj = generate_session_summary(st.session_state.messages, c_test, model_choice, temperature)
+                s_obj = generate_session_summary(
+                    st.session_state.messages, c_test, model_choice, temperature
+                )
             if s_obj["success"]:
                 st.session_state.generated_summaries.append(s_obj["text"])
-                st.session_state.last_summary_len  = len([m for m in st.session_state.messages if m["role"] != "system"])
+                st.session_state.last_summary_len = len(
+                    [m for m in st.session_state.messages if m["role"] != "system"]
+                )
                 st.session_state.last_summary_time = time.time()
                 st.success("Summary added (see 'Past summaries').")
             else:
                 st.error(s_obj["text"])
 
         if len(st.session_state.messages) > 1:
-            transcript = "\n\n".join(f"{m['role'].upper()}: {m['content']}"
-                                     for m in st.session_state.messages if m["role"] != "system")
-            st.download_button("Download transcript", transcript,
-                               "recoverai_transcript.txt", use_container_width=True)
+            transcript = "\n\n".join(
+                f"{m['role'].upper()}: {m['content']}"
+                for m in st.session_state.messages
+                if m["role"] != "system"
+            )
+            st.download_button(
+                "Download transcript",
+                transcript,
+                "recoverai_transcript.txt",
+                use_container_width=True,
+            )
 
         st.checkbox("Show developer panel", key="show_dev")
 
@@ -360,11 +429,13 @@ def main() -> None:
 
     # validate key (dev panel)
     if st.session_state.get("show_dev"):
-        if api_key and (st.session_state.cached_key != api_key
-                        or st.session_state.cached_model != model_choice):
+        if api_key and (
+            st.session_state.cached_key != api_key
+            or st.session_state.cached_model != model_choice
+        ):
             with st.spinner("Validating key…"):
                 st.session_state.key_validated = validate_api_key(api_key, client, model_choice)
-            st.session_state.cached_key   = api_key
+            st.session_state.cached_key = api_key
             st.session_state.cached_model = model_choice
 
     # ─ Display history
@@ -381,24 +452,30 @@ def main() -> None:
 
         msgs_send = prune_history(st.session_state.messages, model_choice)
 
-        # Recovery-mode injection (higher priority than normal but below crisis)
-        if is_recovery_trigger(user_in) and not is_high_risk(user_in):
-            sys = [m for m in msgs_send if m["role"] == "system"]
-            ua  = [m for m in msgs_send if m["role"] != "system"]
-            # Insert recovery-mode guidance after existing system prompt(s)
-            msgs_send = sys + [{"role": "system", "content": RECOVERY_MODE_INJECTION_PROMPT}] + ua
+        sys_msgs = [m for m in msgs_send if m["role"] == "system"]
+        user_and_assist = [m for m in msgs_send if m["role"] != "system"]
 
+        # Priority: high risk (crisis) > deep-state recovery > standard recovery
         if is_high_risk(user_in):
-            st.warning("If you’re thinking of harming yourself, please contact a crisis line "
-                       "(**988** in the US) or local emergency services.")
-            sys = [m for m in msgs_send if m["role"] == "system"]
-            ua  = [m for m in msgs_send if m["role"] != "system"]
-            msgs_send = sys + [{"role": "system", "content": CFG.HIGH_RISK_SAFETY_PROMPT}] + ua
+            st.warning(
+                "If you’re thinking of harming yourself, please contact a crisis line "
+                "(**988** in the US) or local emergency services."
+            )
+            msgs_send = sys_msgs + [{"role": "system", "content": CFG.HIGH_RISK_SAFETY_PROMPT}] + user_and_assist
+        elif is_deep_recovery_trigger(user_in):
+            # Deep-state: layer deep-state prompt then recovery mode prompt (if applicable)
+            injection = []
+            injection.append({"role": "system", "content": DEEP_STATE_RECOVERY_PROMPT})
+            injection.append({"role": "system", "content": RECOVERY_MODE_INJECTION_PROMPT})
+            msgs_send = sys_msgs + injection + user_and_assist
+        elif is_recovery_trigger(user_in):
+            msgs_send = sys_msgs + [{"role": "system", "content": RECOVERY_MODE_INJECTION_PROMPT}] + user_and_assist
 
         with st.chat_message("assistant"):
             with st.spinner("RecoverAI is thinking…"):
-                reply = call_openai_api(msgs_send, client, model_choice,
-                                        temperature, max_tokens)
+                reply = call_openai_api(
+                    msgs_send, client, model_choice, temperature, max_tokens
+                )
             st.markdown(reply)
 
         st.session_state.messages.append({"role": "assistant", "content": reply})
@@ -406,15 +483,20 @@ def main() -> None:
 
     # ─ Automatic summary
     non_sys = len([m for m in st.session_state.messages if m["role"] != "system"])
-    since   = time.time() - st.session_state.last_summary_time
-    if (client and non_sys >= CFG.SUMMARY_TRIGGER_INTERVAL
-            and non_sys - st.session_state.last_summary_len >= CFG.SUMMARY_TRIGGER_INTERVAL
-            and since > CFG.SUMMARY_COOLDOWN_SECONDS):
+    since = time.time() - st.session_state.last_summary_time
+    if (
+        client
+        and non_sys >= CFG.SUMMARY_TRIGGER_INTERVAL
+        and non_sys - st.session_state.last_summary_len >= CFG.SUMMARY_TRIGGER_INTERVAL
+        and since > CFG.SUMMARY_COOLDOWN_SECONDS
+    ):
         with st.spinner("Auto-summarising…"):
-            s_obj = generate_session_summary(st.session_state.messages, client, model_choice, temperature)
+            s_obj = generate_session_summary(
+                st.session_state.messages, client, model_choice, temperature
+            )
         if s_obj["success"]:
             st.session_state.generated_summaries.append(s_obj["text"])
-            st.session_state.last_summary_len  = non_sys
+            st.session_state.last_summary_len = non_sys
             st.session_state.last_summary_time = time.time()
             st.success("Automatic summary added (sidebar).")
 
@@ -451,3 +533,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
