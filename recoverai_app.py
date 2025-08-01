@@ -84,6 +84,40 @@ class AppCfg:
 CFG = AppCfg()  # global constant instance
 
 # ───────────────────────────────────────────────────────────────────────────────
+# Recovery-mode trigger patterns (human phrasing around returning to abuser / going back)
+RECOVERY_TRIGGER_PATTERNS = [
+    r"\bthinking about going back\b",
+    r"\bwant to go back\b",
+    r"\breturn to him\b",
+    r"\breturn to her\b",
+    r"\breunite with (my )?abuser\b",
+    r"\bhe wasn['’]?t that bad\b",
+    r"\bmaybe i should go back\b",
+    r"\bgo back\b",
+    r"\bseeing him again\b",
+    r"\b(i['’]?m considering|i['’]?m thinking of) going back\b",
+]
+
+def is_recovery_trigger(text: str) -> bool:
+    lowered = text.lower()
+    for p in RECOVERY_TRIGGER_PATTERNS:
+        if re.search(p, lowered):
+            return True
+    return False
+
+# This prompt adjusts voice when the above recovery trigger fires.
+RECOVERY_MODE_INJECTION_PROMPT = (
+    "You are now in RecoverAI's default recovery mode for someone wrestling with the idea of returning to an abusive or harmful situation. "
+    "Speak in a normal, human, grounded voice—no clinical jargon, no philosophy lectures. Validate their experience and survival logic. "
+    "Ask gently about physical reactions when they think of going back (e.g., 'What does your body do when you picture going back?'). "
+    "Make clear they don't have to decide anything right now. Affirm that safety is not earned, it's deserved. "
+    "Sample phrasing to guide tone: "
+    "'You’re not broken for thinking about going back. It’s what people do when the pain of now feels heavier than the memory of before. "
+    "You don’t need to prove your pain to deserve peace. I’ll still be here, whatever you choose. There’s a difference between staying alive and actually living. You deserve the second one.' "
+    "Offer options, stay present, and end with a gentle affirmation like 'You’re still here. That matters.' Do not pressure or shame."
+)
+
+# ───────────────────────────────────────────────────────────────────────────────
 # Prompt assets
 def build_system_prompt() -> str:
     return (
@@ -111,7 +145,8 @@ def build_system_prompt() -> str:
 
 SUMMARY_PROMPT = (
     "Draft ~150-word concise summary of the conversation so far. Capture:\n"
-    "• Prevailing emotional states\n• Key milestones / insights\n• Immediate concerns\n"
+    "• Prevailing emotional states\n• Key milestones / insights\n"
+    "• Immediate concerns\n"
     "• One realistic next micro-step\nUse RecoverAI’s calm, validating voice."
 )
 
@@ -345,6 +380,13 @@ def main() -> None:
             st.markdown(user_in)
 
         msgs_send = prune_history(st.session_state.messages, model_choice)
+
+        # Recovery-mode injection (higher priority than normal but below crisis)
+        if is_recovery_trigger(user_in) and not is_high_risk(user_in):
+            sys = [m for m in msgs_send if m["role"] == "system"]
+            ua  = [m for m in msgs_send if m["role"] != "system"]
+            # Insert recovery-mode guidance after existing system prompt(s)
+            msgs_send = sys + [{"role": "system", "content": RECOVERY_MODE_INJECTION_PROMPT}] + ua
 
         if is_high_risk(user_in):
             st.warning("If you’re thinking of harming yourself, please contact a crisis line "
