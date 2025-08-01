@@ -291,7 +291,7 @@ def main() -> None:
     # ─ Sidebar
     with st.sidebar:
         st.header("Configuration")
-        api_key     = get_openai_api_key()
+        api_key = st.secrets.get("OPENAI_API_KEY", "")
         model_choice = st.selectbox("Model", CFG.VALID_MODELS,
                                     index=CFG.VALID_MODELS.index(CFG.DEFAULT_MODEL))
         temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.6, 0.1)
