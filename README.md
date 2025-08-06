@@ -1,6 +1,6 @@
 ## 🚫 IP Usage Warning
 
-This repository is made public **only for demonstration and academic evaluation purposes** (e.g., MIT SUD Ventures).
+This repository is made public **only for demonstration and academic evaluation purposes** (e.g., MIT).
 
 All behavioral prompts, AI persona logic, and system architectures remain the **intellectual property of Sadman Sakib**.
 
