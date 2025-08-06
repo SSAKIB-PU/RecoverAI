@@ -1,4 +1,3 @@
-# recoverai_app.py
 """
 RecoverAI — Streamlit front-end
 --------------------------------
@@ -11,26 +10,25 @@ Key features
 • Robust OpenAI error handling with retries, jittered back-off & model fall-back
 • Developer panel (latency, last error, pruning mode, key-check cache)
 • Session reset modal + transcript download
+• Integrated Deadman's Switch for monitoring user inactivity.
 """
-
 from __future__ import annotations
 
 import os
 import re
 import time
 import random
+import threading
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 
 import streamlit as st
-import openai
 import logging
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Optional dependency (token counting) — graceful degradation
 try:
     import tiktoken
-
     TIKTOKEN_AVAILABLE = True
 except ImportError:
     TIKTOKEN_AVAILABLE = False
@@ -50,7 +48,7 @@ except ModuleNotFoundError:
 # Setup structured logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("recoverai")
-    
+
 # Robust NotFoundError import (old / new SDKs)
 try:
     from openai.error import NotFoundError
@@ -67,12 +65,14 @@ class AppCfg:
     )
     DEFAULT_MODEL: str = "gpt-4o-mini"
 
-    MAX_CONTEXT_TOKENS: int = 7_000          # leave buffer for response
-    TOKENS_PER_MESSAGE_OVERHEAD: int = 4     # chat-format overhead heuristic
-    MAX_HISTORY_MESSAGES: int = 30           # fallback when token lib missing
+    MAX_CONTEXT_TOKENS: int = 7_000         # leave buffer for response
+    TOKENS_PER_MESSAGE_OVERHEAD: int = 4    # chat-format overhead heuristic
+    MAX_HISTORY_MESSAGES: int = 30          # fallback when token lib missing
 
-    SUMMARY_TRIGGER_INTERVAL: int = 10       # non-system messages
-    SUMMARY_COOLDOWN_SECONDS: int = 180      # secs between auto-summaries
+    SUMMARY_TRIGGER_INTERVAL: int = 10      # non-system messages
+    SUMMARY_COOLDOWN_SECONDS: int = 180     # secs between auto-summaries
+
+    DEADMAN_TIMEOUT_SECONDS: int = 300      # 5 minutes for inactivity alert
 
     RISK_PATTERNS: tuple[str, ...] = (
         r"kill myself", r"want to die", r"suicide", r"end it all",
@@ -306,7 +306,7 @@ def build_system_prompt() -> str:
 SUMMARY_PROMPT = (
     "Draft ~150-word concise summary of the conversation so far. Capture:\n"
     "• Prevailing emotional states\n"
-    "• Key milestones / insights\n"
+ "• Key milestones / insights\n"
     "• Immediate concerns\n"
     "• One realistic next micro-step\n"
     "Use RecoverAI’s calm, validating voice."
@@ -363,7 +363,7 @@ def is_high_risk(text: str) -> bool:
 # OPENAI HELPERS (augmented for explainability)
 def call_openai_api(
     msgs: List[Dict[str, Any]],
-    client: Optional[Any],
+    client: Optional[openai.OpenAI],
     model: str,
     temperature: float,
     max_tokens: int,
@@ -428,14 +428,7 @@ def call_openai_api(
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-import time
-import threading
-import logging
-from typing import Callable, List, Optional
-
-logger = logging.getLogger("recoverai.deadman")
-logging.basicConfig(level=logging.INFO)
-
+# DEADMAN'S SWITCH
 class DeadmanMonitor:
     """
     A robust deadman switch / escalation monitor.
@@ -528,24 +521,10 @@ class DeadmanMonitor:
                 logger.error("Error in deadman callback: %s", e)
 
 
-# Example usage:
-#
-# def my_alert():
-#     send_secure_notification(...)
-#
-# deadman = DeadmanMonitor(timeout_sec=300)
-# deadman.register_callback(my_alert)
-#
-# # On each user action:
-# deadman.heartbeat()
-#
-# # When shutting down the app:
-# deadman.stop()
-
 # Summaries
 def generate_session_summary(
     history: List[Dict[str, Any]],
-    client: Optional[Any],
+    client: Optional[openai.OpenAI],
     model: str,
     temperature: float,
 ) -> dict[str, Any]:
@@ -555,7 +534,7 @@ def generate_session_summary(
     pruned = prune_history(history.copy(), model)
     pruned.append({"role": "user", "content": SUMMARY_PROMPT})
 
-    txt = call_openai_api(pruned, client, model, temperature, max_tokens=300, allow_retry=False)
+    txt, _ = call_openai_api(pruned, client, model, temperature, max_tokens=300, allow_retry=False)
     ok = bool(txt) and "error" not in txt.lower() and "api key" not in txt.lower()
     return {"success": ok, "text": txt}
 
@@ -563,6 +542,9 @@ def generate_session_summary(
 # ───────────────────────────────────────────────────────────────────────────────
 # Session helpers
 def reset_session(sys_prompt: str) -> None:
+    # Stop any existing deadman monitor before clearing state
+    if "deadman_monitor" in st.session_state:
+        st.session_state.deadman_monitor.stop()
     st.session_state.clear()
     initialize_session(sys_prompt)
 
@@ -579,19 +561,45 @@ def initialize_session(sys_prompt: str) -> None:
         st.session_state.cached_key = None
         st.session_state.cached_model = None
 
+        # Initialize Deadman's Switch
+        def deadman_callback():
+            logger.warning(f"DEADMAN TRIGGERED: User has been inactive for over {CFG.DEADMAN_TIMEOUT_SECONDS} seconds.")
+            # In a real system, this would trigger a secure notification or escalation.
+            # For now, we can just log it or show a message if the app is active.
+            st.toast(f"Inactive for {CFG.DEADMAN_TIMEOUT_SECONDS}s. Are you okay?", icon="❤️‍🩹")
 
-def validate_api_key(api_key: str, client: Optional[Any], model: str) -> bool:
+        monitor = DeadmanMonitor(timeout_sec=CFG.DEADMAN_TIMEOUT_SECONDS)
+        monitor.register_callback(deadman_callback)
+        st.session_state.deadman_monitor = monitor
+
+
+def init_openai_client(api_key: str) -> Optional[openai.OpenAI]:
+    """Initializes the OpenAI client if an API key is provided."""
+    if not api_key:
+        return None
+    try:
+        return openai.OpenAI(api_key=api_key)
+    except Exception as e:
+        st.error(f"Failed to initialize OpenAI client: {e}")
+        return None
+
+def validate_api_key(api_key: str, client: Optional[openai.OpenAI], model: str) -> bool:
     if not api_key or client is None:
         return False
     probe = [
         {"role": "system", "content": "Respond with OK."},
         {"role": "user", "content": "Ping"},
     ]
-    reply = call_openai_api(probe, client, model, 0.0, 5, allow_retry=False)
+    reply, _ = call_openai_api(probe, client, model, 0.0, 5, allow_retry=False)
     return reply.strip().lower().startswith("ok")
 
 
 def get_openai_api_key() -> str:
+    # Prefer Streamlit secrets for deployment, but allow local override
+    api_key = st.secrets.get("OPENAI_API_KEY")
+    if api_key:
+        return api_key
+    
     return st.sidebar.text_input(
         "OpenAI API key",
         type="password",
@@ -613,7 +621,7 @@ def main() -> None:
     # ─ Sidebar
     with st.sidebar:
         st.header("Configuration")
-        api_key = st.secrets.get("OPENAI_API_KEY", "")
+        api_key = get_openai_api_key()
         model_choice = st.selectbox(
             "Model", CFG.VALID_MODELS, index=CFG.VALID_MODELS.index(CFG.DEFAULT_MODEL)
         )
@@ -622,22 +630,27 @@ def main() -> None:
 
         if st.button("Clear conversation", use_container_width=True):
             st.session_state.show_clear_modal = True
+        
+        # Initialize client for sidebar actions
+        client_for_sidebar = init_openai_client(api_key)
 
         if st.button("Manual summary", use_container_width=True):
-            c_test = init_openai_client(api_key)
-            with st.spinner("Summarising…"):
-                s_obj = generate_session_summary(
-                    st.session_state.messages, c_test, model_choice, temperature
-                )
-            if s_obj["success"]:
-                st.session_state.generated_summaries.append(s_obj["text"])
-                st.session_state.last_summary_len = len(
-                    [m for m in st.session_state.messages if m["role"] != "system"]
-                )
-                st.session_state.last_summary_time = time.time()
-                st.success("Summary added (see 'Past summaries').")
+            if not client_for_sidebar:
+                st.error(CFG.USER_ERR["MISSING_KEY"])
             else:
-                st.error(s_obj["text"])
+                with st.spinner("Summarising…"):
+                    s_obj = generate_session_summary(
+                        st.session_state.messages, client_for_sidebar, model_choice, temperature
+                    )
+                if s_obj["success"]:
+                    st.session_state.generated_summaries.append(s_obj["text"])
+                    st.session_state.last_summary_len = len(
+                        [m for m in st.session_state.messages if m["role"] != "system"]
+                    )
+                    st.session_state.last_summary_time = time.time()
+                    st.success("Summary added (see 'Past summaries').")
+                else:
+                    st.error(s_obj["text"])
 
         if len(st.session_state.messages) > 1:
             transcript = "\n\n".join(
@@ -654,7 +667,7 @@ def main() -> None:
 
         st.checkbox("Show developer panel", key="show_dev")
 
-    # ─ OpenAI client (once)
+    # ─ OpenAI client (once per run)
     client = init_openai_client(api_key)
 
     # validate key (dev panel)
@@ -676,6 +689,7 @@ def main() -> None:
 
     # ─ User input
     if user_in := st.chat_input("Your message…"):
+        st.session_state.deadman_monitor.heartbeat() # Send heartbeat on user interaction
         st.session_state.messages.append({"role": "user", "content": user_in})
         with st.chat_message("user"):
             st.markdown(user_in)
@@ -694,16 +708,17 @@ def main() -> None:
             msgs_send = sys_msgs + [{"role": "system", "content": CFG.HIGH_RISK_SAFETY_PROMPT}] + user_and_assist
         elif is_deep_recovery_trigger(user_in):
             # Deep-state: layer deep-state prompt then recovery mode prompt (if applicable)
-            injection = []
-            injection.append({"role": "system", "content": DEEP_STATE_RECOVERY_PROMPT})
-            injection.append({"role": "system", "content": RECOVERY_MODE_INJECTION_PROMPT})
+            injection = [
+                {"role": "system", "content": DEEP_STATE_RECOVERY_PROMPT},
+                {"role": "system", "content": RECOVERY_MODE_INJECTION_PROMPT}
+            ]
             msgs_send = sys_msgs + injection + user_and_assist
         elif is_recovery_trigger(user_in):
             msgs_send = sys_msgs + [{"role": "system", "content": RECOVERY_MODE_INJECTION_PROMPT}] + user_and_assist
 
         with st.chat_message("assistant"):
             with st.spinner("RecoverAI is thinking…"):
-                reply = call_openai_api(
+                reply, _ = call_openai_api(
                     msgs_send, client, model_choice, temperature, max_tokens
                 )
             st.markdown(reply)
@@ -733,7 +748,7 @@ def main() -> None:
     # ─ Developer panel
     if st.session_state.get("show_dev"):
         with st.sidebar.expander("DEV / DEBUG", expanded=False):
-            st.info(f"API key valid: **{st.session_state.key_validated}**")
+            st.info(f"API key valid: **{st.session_state.get('key_validated', 'N/A')}**")
             st.info(f"Pruning mode: **{'tokens' if TIKTOKEN_AVAILABLE else 'messages'}**")
             met = st.session_state.get("metrics", {})
             if "last_latency" in met:
@@ -750,7 +765,7 @@ def main() -> None:
 
     # ─ Clear-conversation modal
     if st.session_state.show_clear_modal:
-        with st.modal("Confirm reset"):
+        with st.dialog("Confirm reset"):
             st.write("This will permanently delete the current conversation.")
             c1, c2 = st.columns(2)
             if c1.button("Yes, reset", type="primary", use_container_width=True):
