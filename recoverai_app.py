@@ -24,6 +24,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 import openai
+import logging
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Optional dependency (token counting) — graceful degradation
