@@ -20,7 +20,7 @@ import re
 import time
 import random
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 import openai
@@ -34,6 +34,16 @@ try:
 except ImportError:
     TIKTOKEN_AVAILABLE = False
 
+# Placeholder for Whisper; actual import deferred to runtime to reduce startup weight
+try:
+    import whisper  # if you integrate open-source whisper locally
+except ImportError:
+    whisper = None  # will fallback to stub.
+
+# Setup structured logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("recoverai")
+    
 # Robust NotFoundError import (old / new SDKs)
 try:
     from openai.error import NotFoundError
@@ -88,6 +98,109 @@ class AppCfg:
 CFG = AppCfg()  # global constant instance
 
 # ───────────────────────────────────────────────────────────────────────────────
+# PLUGIN / EXTENSION INTERFACE
+class PluginInterface:
+    """Base class for future plugins: legal adapters, escalation handlers, etc."""
+    def process(self, session_state: dict, incoming: str) -> None:
+        raise NotImplementedError
+
+plugin_registry: List[PluginInterface] = []
+
+def register_plugin(p: PluginInterface):
+    plugin_registry.append(p)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# LEGAL ONTOLOGY / PRECEDENT (stub)
+class LegalOntologyClient:
+    def __init__(self, uri: str = "", auth: Tuple[str, str] = ("", "")):
+        # Placeholder: connect to Neo4j or other graph DB
+        self.uri = uri
+        self.auth = auth
+
+    def query_precedent(self, issue: str, jurisdiction: str) -> List[Dict[str, Any]]:
+        # Real implementation would run graph queries to retrieve relevant cases/statutes
+        logger.debug(f"Querying legal ontology for issue={issue} jurisdiction={jurisdiction}")
+        return [{"case": "Sample v. Example", "citation": "42 U.S.C. § 3614(a)", "summary": "Pattern or practice logic."}]
+
+# ───────────────────────────────────────────────────────────────────────────────
+# EVIDENCE VAULT (stub)
+class EvidenceVault:
+    def __init__(self):
+        # Initialize connection to IPFS / Arweave / decentralized store
+        pass
+
+    def store(self, content_bytes: bytes, metadata: dict) -> str:
+        """
+        Store evidence immutably and return a content address / proof handle.
+        """
+        logger.info("Storing evidence to vault (stub).")
+        # Placeholder: upload and return fake URI
+        return "ipfs://fakehash12345"
+
+    def generate_proof(self, address: str) -> dict:
+        # Return signed proof / timestamp metadata
+        return {"address": address, "timestamp": time.time(), "signature": "stub-signature"}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# JURISDICTION DETECTION (stub)
+def detect_jurisdiction(ip_address: Optional[str]) -> str:
+    """
+    Resolve user location / jurisdiction from IP or user input; fallback to default.
+    """
+    # In real system, call an IP geolocation service or allow user override
+    logger.debug(f"Detecting jurisdiction for IP: {ip_address}")
+    return "WA"  # e.g., Washington state as default
+
+# ───────────────────────────────────────────────────────────────────────────────
+# PRIVACY / DP (placeholder)
+def apply_differential_privacy(data: Any, epsilon: float = 1.0) -> Any:
+    """
+    Apply differential privacy transformation before aggregation.
+    Real implementation would add calibrated noise.
+    """
+    logger.debug(f"Applying DP with ε={epsilon}")
+    return data  # stub; wrap with noise in actual deployment
+
+# ───────────────────────────────────────────────────────────────────────────────
+# MULTIMODAL SUPPORT (audio transcription example)
+def transcribe_audio(audio_bytes: bytes) -> str:
+    """
+    Convert audio to text. If Whisper is installed, use it; otherwise fallback.
+    """
+    if whisper:
+        try:
+            model = whisper.load_model("small")
+            # This assumes audio_bytes is saved; real pipeline would decode appropriately
+            # Placeholder: need to write to temp file, run transcription, etc.
+            return "[transcribed text from whisper]"
+        except Exception as e:
+            logger.warning(f"Whisper transcription failed: {e}")
+    # Fallback stub
+    return "[audio transcription unavailable — please upload text]"
+
+# ───────────────────────────────────────────────────────────────────────────────
+# EXPLAINABLE PROMPT BUILDER (for legal / rights advice)
+def build_legal_explanation_prompt(user_query: str, jurisdiction: str) -> str:
+    """
+    Wrap the user question with meta instructions so model provides chain-of-thought style
+    explanation plus a concise actionable answer with referenced legal context.
+    """
+    ontology = LegalOntologyClient()
+    precedents = ontology.query_precedent(user_query, jurisdiction)
+    precedent_summaries = "\n".join(
+        f"- {p['case']} ({p['citation']}): {p['summary']}" for p in precedents
+    )
+    prompt = (
+        "You are RecoverAI. The user asked: "
+        f"'{user_query}' in jurisdiction {jurisdiction}. "
+        "First, explain step-by-step how you reason about their rights, citing relevant precedent or statutes. "
+        "Then give a concise answer in plain language. "
+        f"Supporting legal context:\n{precedent_summaries}\n"
+        "Always end with a suggested micro-action for the user."
+    )
+    return prompt
+
+
 # Recovery-mode trigger patterns (human phrasing around returning to abuser / going back)
 RECOVERY_TRIGGER_PATTERNS = [
     r"\bthinking about going back\b",
@@ -244,17 +357,7 @@ def is_high_risk(text: str) -> bool:
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# OpenAI helpers
-def init_openai_client(api_key: str | None) -> Optional[Any]:
-    if not api_key:
-        return None
-    try:  # ≥ 1.3
-        return openai.OpenAI(api_key=api_key)
-    except TypeError:  # ≤ 1.2
-        openai.api_key = api_key
-        return openai.OpenAI()
-
-
+# OPENAI HELPERS (augmented for explainability)
 def call_openai_api(
     msgs: List[Dict[str, Any]],
     client: Optional[Any],
@@ -263,55 +366,179 @@ def call_openai_api(
     max_tokens: int,
     allow_retry: bool = True,
     attempt_fallback: bool = True,
-) -> str:
+    explain: bool = False,
+) -> Tuple[str, Optional[str]]:
+    """
+    Returns (answer, reasoning). If explain=True, tries to surface chain-of-thought.
+    """
     if client is None:
-        return CFG.USER_ERR["MISSING_KEY"]
+        return CFG.USER_ERR["MISSING_KEY"], None
 
-    m = st.session_state.setdefault("metrics", {})
+    metrics = st.session_state.setdefault("metrics", {})
     backoff, attempt = 1.0, 0
-
     while attempt < 3:
         attempt += 1
         start = time.time()
         try:
+            effective_msgs = msgs.copy()
+            if explain:
+                # Encourage reasoning without violating safety: subtle "think step by step"
+                effective_msgs.append({
+                    "role": "system",
+                    "content": "Please include your reasoning step-by-step before the final answer, clearly labeled as 'Reasoning'."
+                })
             resp = client.chat.completions.create(
                 model=model,
-                messages=msgs,
+                messages=effective_msgs,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-            m["last_latency"] = time.time() - start
-            return resp.choices[0].message.content or "I received an empty response. Please retry."
-        except NotFoundError:
-            if attempt_fallback and model != CFG.DEFAULT_MODEL:
-                st.warning(f"Model **{model}** unavailable; falling back to **{CFG.DEFAULT_MODEL}**.")
-                return call_openai_api(
-                    msgs,
-                    client,
-                    CFG.DEFAULT_MODEL,
-                    temperature,
-                    max_tokens,
-                    allow_retry,
-                    attempt_fallback=False,
-                )
-            m["last_error"] = f"Model {model!r} not found."
-            return m["last_error"]
+            latency = time.time() - start
+            metrics["last_latency"] = latency
+            content = resp.choices[0].message.content or ""
+            if explain:
+                # Naively split reasoning vs answer if user formatted it
+                if "Reasoning:" in content:
+                    parts = content.split("Reasoning:", 1)
+                    reasoning = parts[1].strip()
+                    answer = parts[0].strip()
+                    return answer, reasoning
+            return content, None
         except Exception as e:
             err = str(e).lower()
-            m["last_error"] = err
+            metrics["last_error"] = err
             if "invalid api key" in err or "authentication" in err:
-                return CFG.USER_ERR["INVALID_KEY"]
+                return CFG.USER_ERR["INVALID_KEY"], None
             if "rate limit" in err:
                 if not allow_retry or attempt >= 3:
-                    return CFG.USER_ERR["RATE_LIMIT"]
-            elif not allow_retry:
-                break
+                    return CFG.USER_ERR["RATE_LIMIT"], None
+            if attempt_fallback and isinstance(e, Exception) and model != CFG.DEFAULT_MODEL:
+                st.warning(f"Model **{model}** failure; falling back to {CFG.DEFAULT_MODEL}.")
+                return call_openai_api(
+                    msgs, client, CFG.DEFAULT_MODEL, temperature, max_tokens,
+                    allow_retry, attempt_fallback=False, explain=explain
+                )
             time.sleep(backoff + random.uniform(0, 1))
             backoff = min(backoff * 2, 8.0)
-    return CFG.USER_ERR["GENERIC"]
+    return CFG.USER_ERR["GENERIC"], None
+
 
 
 # ───────────────────────────────────────────────────────────────────────────────
+import time
+import threading
+import logging
+from typing import Callable, List, Optional
+
+logger = logging.getLogger("recoverai.deadman")
+logging.basicConfig(level=logging.INFO)
+
+class DeadmanMonitor:
+    """
+    A robust deadman switch / escalation monitor.
+
+    - Call .heartbeat() whenever the user interacts.
+    - .start() begins periodic checks in a background thread.
+    - .stop() stops monitoring.
+    - You can register multiple callbacks for on-timeout events.
+    """
+
+    def __init__(
+        self,
+        timeout_sec: float = 120.0,
+        check_interval: float = 5.0,
+        auto_start: bool = True,
+    ):
+        self.timeout = timeout_sec
+        self.check_interval = check_interval
+        self._last_heartbeat = time.time()
+        self._triggered = False
+        self._callbacks: List[Callable[[], None]] = []
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        if auto_start:
+            self.start()
+
+    def heartbeat(self) -> None:
+        """
+        Reset the timer; call this on each user interaction.
+        """
+        with self._lock:
+            self._last_heartbeat = time.time()
+            self._triggered = False
+            logger.debug("DeadmanMonitor heartbeat received.")
+
+    def register_callback(self, fn: Callable[[], None]) -> None:
+        """
+        Add a function to be called once when the timeout triggers.
+        """
+        self._callbacks.append(fn)
+
+    def start(self) -> None:
+        """
+        Start the background thread to monitor heartbeats.
+        """
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        logger.info("DeadmanMonitor started with timeout=%ss, interval=%ss", self.timeout, self.check_interval)
+
+    def stop(self) -> None:
+        """
+        Stop the background monitoring thread.
+        """
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=self.check_interval + 1)
+        logger.info("DeadmanMonitor stopped.")
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            time.sleep(self.check_interval)
+            self.check()
+
+    def check(self) -> None:
+        """
+        If the time since the last heartbeat exceeds timeout, trigger callbacks once.
+        """
+        with self._lock:
+            elapsed = time.time() - self._last_heartbeat
+            if elapsed > self.timeout and not self._triggered:
+                self._triggered = True
+                logger.warning("DeadmanMonitor timeout reached (%.1fs elapsed)", elapsed)
+                self._on_timeout()
+
+    def _on_timeout(self) -> None:
+        """
+        Internal: call registered callbacks. If none, default to logging.
+        """
+        if not self._callbacks:
+            logger.warning("No callbacks registered; escalation should occur here.")
+        for fn in self._callbacks:
+            try:
+                fn()
+            except Exception as e:
+                logger.error("Error in deadman callback: %s", e)
+
+
+# Example usage:
+#
+# def my_alert():
+#     send_secure_notification(...)
+#
+# deadman = DeadmanMonitor(timeout_sec=300)
+# deadman.register_callback(my_alert)
+#
+# # On each user action:
+# deadman.heartbeat()
+#
+# # When shutting down the app:
+# deadman.stop()
+
 # Summaries
 def generate_session_summary(
     history: List[Dict[str, Any]],
