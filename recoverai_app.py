@@ -41,20 +41,22 @@ try:
 except ImportError:
     whisper = None  # will fallback to stub.
 
+try:
+    import openai
+except ModuleNotFoundError:
+    st.error("The `openai` package is not installed. Run `pip install openai` and restart.")
+    raise
+
 # Setup structured logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("recoverai")
     
 # Robust NotFoundError import (old / new SDKs)
 try:
     from openai.error import NotFoundError
-except ImportError:
-    try:
-        from openai import NotFoundError
-    except ImportError:  # very old SDK
-        class NotFoundError(Exception):  # noqa: D401
-            """Fallback placeholder when SDK doesn't expose NotFoundError."""
-
+except ImportError:  # older < 1.0 SDK
+    class NotFoundError(Exception):
+        """Fallback when openai.NotFoundError is absent."""
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Global configuration (immutable dataclass)
